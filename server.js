@@ -7,7 +7,7 @@ import fetch from 'node-fetch';
 const app = express();
 const server = http.createServer(app);
 
-const FRONTEND_URL = process.env.FRONTEND_URL || "https://new-quiz-app-five.vercel.app/";
+const FRONTEND_URL = process.env.FRONTEND_URL || "https://quiz-end-five.vercel.app/";
 
 app.use(cors({
   origin: FRONTEND_URL,
