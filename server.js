@@ -1,727 +1,656 @@
-import express from 'express';
-import http from 'http';
-import { Server } from 'socket.io';
-import cors from 'cors';
-import fetch from 'node-fetch';
+// server.js
+const express = require('express');
+const http = require('http');
+const socketIo = require('socket.io');
+const cors = require('cors');
+const path = require('path');
 
 const app = express();
 const server = http.createServer(app);
-
-const FRONTEND_URL = process.env.FRONTEND_URL || "https://quiz-end-five.vercel.app/";
-
-app.use(cors({
-  origin: FRONTEND_URL,
-  methods: ["GET", "POST"],
-  credentials: true
-}));
-
-app.use(express.json());
-
-// Enhanced Socket.io configuration
-const io = new Server(server, {
+const io = socketIo(server, {
   cors: {
-    origin: FRONTEND_URL,
-    methods: ["GET", "POST"],
-    credentials: true
+    origin: "*",
+    methods: ["GET", "POST"]
+  }
+});
+
+// Middleware
+app.use(cors());
+app.use(express.json());
+app.use(express.static(path.join(__dirname, 'public')));
+
+// In-memory storage (in production, use a database)
+const games = new Map();
+const users = new Map();
+const questions = require('./questions-database');
+const leaderboard = [];
+
+// Utility functions
+const generateGameCode = () => {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+  let code = '';
+  for (let i = 0; i < 6; i++) {
+    code += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return code;
+};
+
+const calculateScore = (correctAnswers, totalQuestions, timeTaken) => {
+  const baseScore = (correctAnswers / totalQuestions) * 100;
+  const timeBonus = Math.max(0, 100 - timeTaken) * 0.1; // Bonus for faster completion
+  return Math.round(baseScore + timeBonus);
+};
+
+// Question management
+const questionService = {
+  getQuestions(category, subject, difficulty, count) {
+    let availableQuestions = questions[category]?.[subject]?.[difficulty] || [];
+    
+    // If no questions for specific difficulty, get any questions for this subject
+    if (availableQuestions.length === 0) {
+      const subjectQuestions = questions[category]?.[subject];
+      if (subjectQuestions) {
+        availableQuestions = Object.values(subjectQuestions).flat();
+      }
+    }
+    
+    // Shuffle and return requested number of questions
+    const shuffled = [...availableQuestions].sort(() => 0.5 - Math.random());
+    return shuffled.slice(0, count);
   },
-  pingTimeout: 60000,
-  pingInterval: 25000
-});
 
-// Question API Service
-class QuestionService {
-  constructor() {
-    this.cache = new Map();
-    this.cacheTimeout = 10 * 60 * 1000; // 10 minutes
+  validateAnswer(question, selectedIndex) {
+    return {
+      isCorrect: selectedIndex === question.correctAnswer,
+      correctAnswer: question.correctAnswer,
+      explanation: question.explanation
+    };
   }
+};
 
-  async getQuestions(category, subject, difficulty = 'medium', amount = 10) {
-    const cacheKey = `${category}-${subject}-${difficulty}-${amount}`;
+// Game management
+const gameService = {
+  createGame(hostId, playerName, avatar, settings) {
+    const gameCode = generateGameCode();
     
-    // Check cache first
-    if (this.cache.has(cacheKey)) {
-      const cached = this.cache.get(cacheKey);
-      if (Date.now() - cached.timestamp < this.cacheTimeout) {
-        return cached.questions;
-      }
-    }
-
-    try {
-      let questions = [];
-      
-      // Try different question APIs
-      questions = await this.fetchOpenTriviaDB(category, difficulty, amount) ||
-                 await this.fetchQuizAPI(category, difficulty, amount) ||
-                 this.getFallbackQuestions(category, subject);
-
-      // Cache the results
-      this.cache.set(cacheKey, {
-        questions: questions,
-        timestamp: Date.now()
-      });
-
-      return questions;
-    } catch (error) {
-      console.error('Error fetching questions:', error);
-      return this.getFallbackQuestions(category, subject);
-    }
-  }
-
-  async fetchOpenTriviaDB(category, difficulty, amount) {
-    try {
-      // Map our categories to OpenTrivia categories
-      const categoryMap = {
-        'primary': 9, // General Knowledge for primary
-        'highschool': 19, // Science for high school
-        'tertiary': 18  // Computers for tertiary
-      };
-
-      const categoryId = categoryMap[category] || 9;
-      const url = `https://opentdb.com/api.php?amount=${amount}&category=${categoryId}&difficulty=${difficulty}&type=multiple`;
-      
-      const response = await fetch(url);
-      const data = await response.json();
-
-      if (data.response_code === 0 && data.results) {
-        return data.results.map(q => ({
-          question: this.decodeHTML(q.question),
-          options: this.shuffleArray([
-            ...q.incorrect_answers.map(a => this.decodeHTML(a)),
-            this.decodeHTML(q.correct_answer)
-          ]),
-          correct: q.incorrect_answers.length, // Correct answer is always last after shuffle
-          explanation: `Category: ${q.category} | Difficulty: ${q.difficulty}`,
-          source: 'OpenTriviaDB'
-        }));
-      }
-    } catch (error) {
-      console.log('OpenTriviaDB fetch failed:', error.message);
-    }
-    return null;
-  }
-
-  async fetchQuizAPI(category, difficulty, amount) {
-    try {
-      // QuizAPI requires an API key - using demo mode
-      const url = `https://quizapi.io/api/v1/questions?apiKey=${process.env.QUIZAPI_KEY || 'demo'}&limit=${amount}&difficulty=${difficulty}`;
-      
-      const response = await fetch(url);
-      const data = await response.json();
-
-      if (Array.isArray(data) && data.length > 0) {
-        return data.map(q => ({
-          question: q.question,
-          options: Object.values(q.answers).filter(Boolean),
-          correct: Object.values(q.correct_answers).findIndex((val, idx) => val === 'true'),
-          explanation: q.explanation || `Category: ${q.category} | Difficulty: ${q.difficulty}`,
-          source: 'QuizAPI'
-        }));
-      }
-    } catch (error) {
-      console.log('QuizAPI fetch failed:', error.message);
-    }
-    return null;
-  }
-
-  getFallbackQuestions(category, subject) {
-    // Comprehensive fallback questions
-    const fallbackQuestions = {
-      primary: {
-        mathematics: [
-          {
-            question: "What is 5 + 7?",
-            options: ["11", "12", "13", "14"],
-            correct: 1,
-            explanation: "5 + 7 equals 12",
-            source: "fallback"
-          },
-          {
-            question: "How many sides does a triangle have?",
-            options: ["2", "3", "4", "5"],
-            correct: 1,
-            explanation: "A triangle has 3 sides",
-            source: "fallback"
-          },
-          {
-            question: "What is 8 × 3?",
-            options: ["16", "24", "32", "40"],
-            correct: 1,
-            explanation: "8 × 3 equals 24",
-            source: "fallback"
-          }
-        ],
-        science: [
-          {
-            question: "Which animal lays eggs?",
-            options: ["Dog", "Cat", "Bird", "Cow"],
-            correct: 2,
-            explanation: "Birds lay eggs",
-            source: "fallback"
-          },
-          {
-            question: "What planet do we live on?",
-            options: ["Mars", "Venus", "Earth", "Jupiter"],
-            correct: 2,
-            explanation: "We live on planet Earth",
-            source: "fallback"
-          }
-        ],
-        english: [
-          {
-            question: "What is the past tense of 'run'?",
-            options: ["Running", "Runned", "Ran", "Runs"],
-            correct: 2,
-            explanation: "The past tense of run is ran",
-            source: "fallback"
-          },
-          {
-            question: "Which word is a noun?",
-            options: ["Run", "Beautiful", "School", "Quickly"],
-            correct: 2,
-            explanation: "School is a noun - it's a place",
-            source: "fallback"
-          }
-        ],
-        social_studies: [
-          {
-            question: "What is the capital of the United States?",
-            options: ["New York", "Los Angeles", "Washington D.C.", "Chicago"],
-            correct: 2,
-            explanation: "Washington D.C. is the capital of the United States",
-            source: "fallback"
-          }
-        ]
-      },
-      highschool: {
-        mathematics: [
-          {
-            question: "What is the value of π (pi) approximately?",
-            options: ["3.14", "2.71", "1.61", "4.13"],
-            correct: 0,
-            explanation: "π is approximately 3.14159",
-            source: "fallback"
-          },
-          {
-            question: "Solve for x: 2x + 5 = 15",
-            options: ["5", "10", "7.5", "20"],
-            correct: 0,
-            explanation: "2x + 5 = 15 → 2x = 10 → x = 5",
-            source: "fallback"
-          }
-        ],
-        physics: [
-          {
-            question: "What is the unit of force?",
-            options: ["Joule", "Watt", "Newton", "Volt"],
-            correct: 2,
-            explanation: "Force is measured in Newtons",
-            source: "fallback"
-          },
-          {
-            question: "What is the speed of light?",
-            options: ["300,000 km/s", "150,000 km/s", "500,000 km/s", "1,000,000 km/s"],
-            correct: 0,
-            explanation: "The speed of light is approximately 300,000 km/s",
-            source: "fallback"
-          }
-        ],
-        chemistry: [
-          {
-            question: "What is the chemical symbol for water?",
-            options: ["H2O", "CO2", "O2", "NaCl"],
-            correct: 0,
-            explanation: "Water is H2O - two hydrogen atoms and one oxygen atom",
-            source: "fallback"
-          },
-          {
-            question: "What is the atomic number of oxygen?",
-            options: ["6", "7", "8", "9"],
-            correct: 2,
-            explanation: "Oxygen has an atomic number of 8",
-            source: "fallback"
-          }
-        ],
-        biology: [
-          {
-            question: "What is the powerhouse of the cell?",
-            options: ["Nucleus", "Mitochondria", "Ribosome", "Cell membrane"],
-            correct: 1,
-            explanation: "Mitochondria produce energy for the cell",
-            source: "fallback"
-          }
-        ],
-        history: [
-          {
-            question: "In which year did World War II end?",
-            options: ["1944", "1945", "1946", "1947"],
-            correct: 1,
-            explanation: "World War II ended in 1945",
-            source: "fallback"
-          }
-        ],
-        geography: [
-          {
-            question: "What is the longest river in the world?",
-            options: ["Amazon River", "Nile River", "Yangtze River", "Mississippi River"],
-            correct: 1,
-            explanation: "The Nile River is the longest river in the world",
-            source: "fallback"
-          }
-        ]
-      },
-      tertiary: {
-        programming: [
-          {
-            question: "What does HTML stand for?",
-            options: ["Hyper Text Markup Language", "High Tech Modern Language", "Hyper Transfer Markup Language", "Home Tool Markup Language"],
-            correct: 0,
-            explanation: "HTML stands for Hyper Text Markup Language",
-            source: "fallback"
-          },
-          {
-            question: "Which language is known as the language of the web?",
-            options: ["Python", "Java", "JavaScript", "C++"],
-            correct: 2,
-            explanation: "JavaScript is the primary language for web development",
-            source: "fallback"
-          }
-        ],
-        business: [
-          {
-            question: "What does ROI stand for in business?",
-            options: ["Return on Investment", "Rate of Interest", "Return of Income", "Risk of Investment"],
-            correct: 0,
-            explanation: "ROI stands for Return on Investment",
-            source: "fallback"
-          }
-        ],
-        engineering: [
-          {
-            question: "What is the SI unit of electrical resistance?",
-            options: ["Volt", "Ampere", "Ohm", "Watt"],
-            correct: 2,
-            explanation: "Electrical resistance is measured in Ohms",
-            source: "fallback"
-          }
-        ],
-        medicine: [
-          {
-            question: "What does DNA stand for?",
-            options: ["Deoxyribonucleic Acid", "Digital Network Analysis", "Dynamic Neural Activity", "Diagnostic Nuclear Assessment"],
-            correct: 0,
-            explanation: "DNA stands for Deoxyribonucleic Acid",
-            source: "fallback"
-          }
-        ],
-        law: [
-          {
-            question: "What is the highest court in the United States?",
-            options: ["District Court", "Appeals Court", "Supreme Court", "Circuit Court"],
-            correct: 2,
-            explanation: "The Supreme Court is the highest court in the US",
-            source: "fallback"
-          }
-        ],
-        economics: [
-          {
-            question: "What does GDP stand for?",
-            options: ["Gross Domestic Product", "General Domestic Production", "Government Development Program", "Global Development Protocol"],
-            correct: 0,
-            explanation: "GDP stands for Gross Domestic Product",
-            source: "fallback"
-          }
-        ]
-      }
-    };
-
-    return fallbackQuestions[category]?.[subject] || fallbackQuestions.primary.mathematics;
-  }
-
-  decodeHTML(html) {
-    const txt = document.createElement('textarea');
-    txt.innerHTML = html;
-    return txt.value;
-  }
-
-  shuffleArray(array) {
-    const shuffled = [...array];
-    for (let i = shuffled.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
-    }
-    return shuffled;
-  }
-}
-
-const questionService = new QuestionService();
-
-// Enhanced Game Manager with API support
-class GameManager {
-  constructor() {
-    this.activeGames = new Map();
-    this.playerSessions = new Map();
-    this.connectionStats = {
-      totalConnections: 0,
-      activeConnections: 0,
-      totalGamesCreated: 0
-    };
-  }
-
-  async createGame(socket, data) {
-    try {
-      const gameId = this.generateGameId();
-      
-      // Fetch questions from API
-      const questions = await questionService.getQuestions(
-        data.category || 'primary',
-        data.subject || 'mathematics',
-        data.difficulty || 'medium',
-        data.amount || 10
-      );
-
-      const game = {
-        id: gameId,
-        host: socket.id,
-        category: data.category || 'primary',
-        subject: data.subject || 'mathematics',
-        difficulty: data.difficulty || 'medium',
-        players: [{
-          id: socket.id,
-          name: data.playerName || 'Player',
-          score: 0,
-          progress: 0,
-          avatar: data.avatar || '👨‍💻',
-          connected: true,
-          joinTime: Date.now()
-        }],
-        status: 'waiting',
-        currentQuestion: 0,
-        answers: new Map(),
-        questions: questions,
-        createdAt: Date.now(),
-        lastActivity: Date.now()
-      };
-      
-      this.activeGames.set(gameId, game);
-      this.playerSessions.set(socket.id, gameId);
-      this.connectionStats.totalGamesCreated++;
-      
-      socket.join(gameId);
-      
-      console.log(`🎮 Game created: ${gameId} (${game.category} - ${game.subject})`);
-      
-      return { gameId, game: this.sanitizeGame(game) };
-    } catch (error) {
-      console.error('Error creating game:', error);
-      throw new Error('Failed to create game: ' + error.message);
-    }
-  }
-
-  joinGame(socket, data) {
-    try {
-      const gameId = data.gameId?.toUpperCase();
-      const game = this.activeGames.get(gameId);
-      
-      if (!game) {
-        throw new Error('Game not found. Check your game code.');
-      }
-
-      if (game.status !== 'waiting') {
-        throw new Error('Game already in progress');
-      }
-
-      if (game.players.length >= 8) {
-        throw new Error('Game is full (max 8 players)');
-      }
-
-      const player = {
-        id: socket.id,
-        name: data.playerName || 'Player',
+    const game = {
+      gameCode,
+      hostId,
+      players: new Map([[hostId, {
+        id: hostId,
+        name: playerName,
+        avatar,
         score: 0,
-        progress: 0,
-        avatar: data.avatar || '👨‍💻',
-        connected: true,
-        joinTime: Date.now()
-      };
-
-      game.players.push(player);
-      game.lastActivity = Date.now();
-      this.playerSessions.set(socket.id, gameId);
-      socket.join(gameId);
-
-      console.log(`👤 ${player.name} joined game ${gameId}`);
-
-      return {
-        player,
-        players: game.players
-      };
-    } catch (error) {
-      console.error('Error joining game:', error);
-      throw error;
-    }
-  }
-
-  startGame(socket, data) {
-    const gameId = this.playerSessions.get(socket.id);
-    const game = this.activeGames.get(gameId);
-    
-    if (game && game.host === socket.id && game.status === 'waiting') {
-      if (game.players.length < 1) {
-        throw new Error('Need at least 1 player to start');
-      }
-
-      game.status = 'playing';
-      game.startTime = Date.now();
-      game.lastActivity = Date.now();
-      
-      console.log(`🚀 Game ${gameId} started with ${game.players.length} players`);
-      
-      return {
-        questions: game.questions,
-        totalQuestions: game.questions.length,
-        players: game.players
-      };
-    }
-    throw new Error('Only the host can start the game');
-  }
-
-  submitAnswer(socket, data) {
-    const gameId = this.playerSessions.get(socket.id);
-    const game = this.activeGames.get(gameId);
-    
-    if (game && game.status === 'playing') {
-      game.lastActivity = Date.now();
-      
-      if (!game.answers.has(data.questionIndex)) {
-        game.answers.set(data.questionIndex, new Map());
-      }
-      
-      game.answers.get(data.questionIndex).set(socket.id, {
-        answer: data.answer,
-        timestamp: Date.now()
-      });
-
-      // Update player progress
-      const player = game.players.find(p => p.id === socket.id);
-      if (player) {
-        player.progress = ((data.questionIndex + 1) / game.questions.length) * 100;
-        
-        // Calculate temporary score for display
-        const currentAnswer = game.answers.get(data.questionIndex).get(socket.id);
-        const question = game.questions[data.questionIndex];
-        if (currentAnswer.answer === question.correct) {
-          player.score += 10;
-        }
-      }
-
-      return {
-        players: game.players.map(p => ({
-          id: p.id,
-          name: p.name,
-          score: p.score,
-          progress: p.progress,
-          avatar: p.avatar
-        }))
-      };
-    }
-    throw new Error('Game not in progress');
-  }
-
-  handleDisconnect(socket) {
-    const gameId = this.playerSessions.get(socket.id);
-    if (gameId) {
-      const game = this.activeGames.get(gameId);
-      if (game) {
-        const player = game.players.find(p => p.id === socket.id);
-        if (player) {
-          player.connected = false;
-          console.log(`👋 ${player.name} disconnected from game ${gameId}`);
-        }
-      }
-      this.playerSessions.delete(socket.id);
-    }
-    this.connectionStats.activeConnections--;
-  }
-
-  generateGameId() {
-    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
-    let result = '';
-    for (let i = 0; i < 4; i++) {
-      result += chars.charAt(Math.floor(Math.random() * chars.length));
-    }
-    return result;
-  }
-
-  sanitizeGame(game) {
-    return {
-      id: game.id,
-      host: game.host,
-      category: game.category,
-      subject: game.subject,
-      players: game.players,
-      status: game.status,
-      currentQuestion: game.currentQuestion,
-      totalQuestions: game.questions.length
+        ready: true,
+        answers: [],
+        connected: true
+      }]]),
+      settings,
+      status: 'waiting', // waiting, starting, in-progress, finished
+      currentQuestion: 0,
+      questions: [],
+      startTime: null,
+      created: new Date()
     };
-  }
+    
+    games.set(gameCode, game);
+    return game;
+  },
 
-  getStats() {
-    return {
-      ...this.connectionStats,
-      activeGames: this.activeGames.size,
-      playerSessions: this.playerSessions.size
+  joinGame(gameCode, playerId, playerName, avatar) {
+    const game = games.get(gameCode);
+    if (!game) {
+      throw new Error('Game not found');
+    }
+    
+    if (game.status !== 'waiting') {
+      throw new Error('Game already in progress');
+    }
+    
+    if (game.players.size >= 8) {
+      throw new Error('Game is full');
+    }
+    
+    const player = {
+      id: playerId,
+      name: playerName,
+      avatar,
+      score: 0,
+      ready: false,
+      answers: [],
+      connected: true
     };
-  }
-}
-
-const gameManager = new GameManager();
-
-// Socket.io connection handling
-io.on('connection', (socket) => {
-  gameManager.connectionStats.totalConnections++;
-  gameManager.connectionStats.activeConnections++;
-  
-  console.log(`✅ User connected: ${socket.id} (Total: ${gameManager.connectionStats.activeConnections})`);
-
-  // Send immediate welcome message
-  socket.emit('welcome', { 
-    message: 'Connected to quiz server', 
-    timestamp: Date.now(),
-    connectionId: socket.id
-  });
-
-  // Create a new game
-  socket.on('create-game', async (data) => {
-    try {
-      const result = await gameManager.createGame(socket, data);
-      socket.emit('game-created', result);
-    } catch (error) {
-      socket.emit('error', { message: error.message });
-    }
-  });
-
-  // Join existing game
-  socket.on('join-game', (data) => {
-    try {
-      const result = gameManager.joinGame(socket, data);
-      socket.to(data.gameId).emit('player-joined', result);
-      socket.emit('player-joined', result);
-    } catch (error) {
-      socket.emit('error', { message: error.message });
-    }
-  });
-
-  // Start the game
-  socket.on('start-game', (data) => {
-    try {
-      const result = gameManager.startGame(socket, data);
-      io.to(data.gameId).emit('game-started', result);
-    } catch (error) {
-      socket.emit('error', { message: error.message });
-    }
-  });
-
-  // Player answers a question
-  socket.on('submit-answer', (data) => {
-    try {
-      const result = gameManager.submitAnswer(socket, data);
-      io.to(gameManager.playerSessions.get(socket.id)).emit('player-progress', result);
-    } catch (error) {
-      socket.emit('error', { message: error.message });
-    }
-  });
-
-  // Manual ping from client
-  socket.on('ping', (data) => {
-    socket.emit('pong', { 
-      timestamp: Date.now(),
-      serverTime: Date.now() 
-    });
-  });
-
-  socket.on('disconnect', (reason) => {
-    console.log(`❌ User disconnected: ${socket.id}, Reason: ${reason}`);
-    gameManager.handleDisconnect(socket);
-  });
-});
-
-// API Routes
-app.get('/api/categories', (req, res) => {
-  const categories = {
-    primary: {
-      name: "Primary Level",
-      subjects: ["mathematics", "science", "english", "social_studies"],
-      difficulties: ["easy", "medium"],
-      description: "Grades 1-6: Basic subjects and foundational knowledge"
-    },
-    highschool: {
-      name: "High School",
-      subjects: ["mathematics", "physics", "chemistry", "biology", "history", "geography"],
-      difficulties: ["easy", "medium", "hard"],
-      description: "Grades 7-12: Advanced sciences and specialized subjects"
-    },
-    tertiary: {
-      name: "Tertiary Level",
-      subjects: ["programming", "business", "engineering", "medicine", "law", "economics"],
-      difficulties: ["medium", "hard"],
-      description: "College & University: Professional and specialized topics"
-    }
-  };
-  res.json(categories);
-});
-
-app.get('/api/questions', async (req, res) => {
-  try {
-    const { category, subject, difficulty, amount } = req.query;
     
-    const questions = await questionService.getQuestions(
-      category || 'primary',
-      subject || 'mathematics',
-      difficulty || 'medium',
-      parseInt(amount) || 10
-    );
-    
-    res.json({
-      success: true,
-      category,
-      subject,
-      difficulty,
-      amount: questions.length,
-      questions: questions
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      error: error.message
-    });
-  }
-});
+    game.players.set(playerId, player);
+    return game;
+  },
 
-app.get('/health', (req, res) => {
-  const stats = gameManager.getStats();
+  startGame(gameCode) {
+    const game = games.get(gameCode);
+    if (!game) {
+      throw new Error('Game not found');
+    }
+    
+    if (game.status !== 'waiting') {
+      throw new Error('Game already started');
+    }
+    
+    if (game.players.size < 1) {
+      throw new Error('Not enough players');
+    }
+    
+    // Get questions for the game
+    const { category, subject, difficulty, questionCount } = game.settings;
+    game.questions = questionService.getQuestions(category, subject, difficulty, questionCount);
+    
+    if (game.questions.length === 0) {
+      throw new Error('No questions available for this configuration');
+    }
+    
+    game.status = 'starting';
+    game.startTime = new Date();
+    
+    // Set a timeout to automatically start the game
+    setTimeout(() => {
+      if (game.status === 'starting') {
+        game.status = 'in-progress';
+        io.to(gameCode).emit('gameStarted', {
+          questions: game.questions,
+          totalQuestions: game.questions.length
+        });
+      }
+    }, 5000);
+    
+    return game;
+  },
+
+  submitAnswer(gameCode, playerId, questionIndex, selectedIndex, timestamp) {
+    const game = games.get(gameCode);
+    if (!game) {
+      throw new Error('Game not found');
+    }
+    
+    if (game.status !== 'in-progress') {
+      throw new Error('Game not in progress');
+    }
+    
+    const player = game.players.get(playerId);
+    if (!player) {
+      throw new Error('Player not in game');
+    }
+    
+    const question = game.questions[questionIndex];
+    if (!question) {
+      throw new Error('Invalid question');
+    }
+    
+    // Check if player already answered this question
+    const existingAnswer = player.answers.find(a => a.questionIndex === questionIndex);
+    if (existingAnswer) {
+      throw new Error('Already answered this question');
+    }
+    
+    const result = questionService.validateAnswer(question, selectedIndex);
+    
+    // Calculate points (base points + time bonus)
+    const timeElapsed = timestamp - game.startTime;
+    const timeBonus = Math.max(0, 30 - (timeElapsed / 1000)) * 10; // Bonus for answering quickly
+    
+    const points = result.isCorrect ? 100 + timeBonus : 0;
+    player.score += points;
+    
+    player.answers.push({
+      questionIndex,
+      selectedIndex,
+      isCorrect: result.isCorrect,
+      points,
+      timestamp
+    });
+    
+    return {
+      playerId,
+      score: player.score,
+      isCorrect: result.isCorrect,
+      correctAnswer: result.correctAnswer,
+      explanation: result.explanation
+    };
+  },
+
+  getGameResults(gameCode) {
+    const game = games.get(gameCode);
+    if (!game) {
+      throw new Error('Game not found');
+    }
+    
+    const players = Array.from(game.players.values())
+      .map(player => ({
+        id: player.id,
+        name: player.name,
+        avatar: player.avatar,
+        score: player.score,
+        correctAnswers: player.answers.filter(a => a.isCorrect).length,
+        totalQuestions: game.questions.length
+      }))
+      .sort((a, b) => b.score - a.score);
+    
+    return {
+      players,
+      questions: game.questions.length,
+      duration: new Date() - game.startTime
+    };
+  },
+
+  cleanupOldGames() {
+    const now = new Date();
+    const MAX_GAME_AGE = 2 * 60 * 60 * 1000; // 2 hours
+    
+    for (const [gameCode, game] of games.entries()) {
+      if (now - game.created > MAX_GAME_AGE) {
+        games.delete(gameCode);
+        console.log(`Cleaned up old game: ${gameCode}`);
+      }
+    }
+  }
+};
+
+// REST API Routes
+
+// Health check
+app.get('/api/health', (req, res) => {
   res.json({ 
     status: 'OK', 
     timestamp: new Date().toISOString(),
-    environment: process.env.NODE_ENV || 'development',
-    ...stats
+    activeGames: games.size,
+    activeUsers: users.size
   });
 });
 
-// 404 handler
-app.use('*', (req, res) => {
-  res.status(404).json({ 
-    error: 'Route not found',
-    availableRoutes: ['/health', '/api/categories', '/api/questions']
+// Get questions
+app.post('/api/questions', (req, res) => {
+  try {
+    const { category, subject, difficulty, count = 10 } = req.body;
+    
+    if (!category || !subject || !difficulty) {
+      return res.status(400).json({ 
+        error: 'Missing required fields: category, subject, difficulty' 
+      });
+    }
+    
+    const questionList = questionService.getQuestions(category, subject, difficulty, count);
+    
+    res.json({
+      questions: questionList,
+      total: questionList.length,
+      category,
+      subject,
+      difficulty
+    });
+    
+  } catch (error) {
+    console.error('Error fetching questions:', error);
+    res.status(500).json({ error: 'Failed to fetch questions' });
+  }
+});
+
+// Submit quiz results
+app.post('/api/results', (req, res) => {
+  try {
+    const { 
+      playerName, 
+      category, 
+      subject, 
+      score, 
+      correctAnswers, 
+      totalQuestions, 
+      timeTaken,
+      difficulty 
+    } = req.body;
+    
+    const result = {
+      playerName,
+      category,
+      subject,
+      score,
+      correctAnswers,
+      totalQuestions,
+      accuracy: (correctAnswers / totalQuestions) * 100,
+      timeTaken,
+      difficulty,
+      timestamp: new Date()
+    };
+    
+    // Add to leaderboard
+    leaderboard.push(result);
+    
+    // Keep only top 100 scores
+    if (leaderboard.length > 100) {
+      leaderboard.sort((a, b) => b.score - a.score);
+      leaderboard.splice(100);
+    }
+    
+    res.json({ 
+      success: true, 
+      rank: leaderboard.length,
+      message: 'Results saved successfully' 
+    });
+    
+  } catch (error) {
+    console.error('Error saving results:', error);
+    res.status(500).json({ error: 'Failed to save results' });
+  }
+});
+
+// Get leaderboard
+app.get('/api/leaderboard', (req, res) => {
+  try {
+    const { category, subject, limit = 10 } = req.query;
+    
+    let filteredLeaderboard = leaderboard;
+    
+    if (category) {
+      filteredLeaderboard = filteredLeaderboard.filter(item => 
+        item.category.toLowerCase() === category.toLowerCase()
+      );
+    }
+    
+    if (subject) {
+      filteredLeaderboard = filteredLeaderboard.filter(item => 
+        item.subject.toLowerCase() === subject.toLowerCase()
+      );
+    }
+    
+    // Sort by score (descending) and get top results
+    const topScores = filteredLeaderboard
+      .sort((a, b) => b.score - a.score)
+      .slice(0, parseInt(limit));
+    
+    res.json({
+      leaderboard: topScores,
+      total: filteredLeaderboard.length,
+      category,
+      subject
+    });
+    
+  } catch (error) {
+    console.error('Error fetching leaderboard:', error);
+    res.status(500).json({ error: 'Failed to fetch leaderboard' });
+  }
+});
+
+// Get user statistics
+app.get('/api/users/:userId/stats', (req, res) => {
+  try {
+    const { userId } = req.params;
+    
+    const userResults = leaderboard.filter(result => 
+      result.playerName === userId
+    );
+    
+    if (userResults.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    const stats = {
+      totalQuizzes: userResults.length,
+      averageScore: userResults.reduce((sum, result) => sum + result.score, 0) / userResults.length,
+      averageAccuracy: userResults.reduce((sum, result) => sum + result.accuracy, 0) / userResults.length,
+      bestScore: Math.max(...userResults.map(result => result.score)),
+      totalCorrectAnswers: userResults.reduce((sum, result) => sum + result.correctAnswers, 0),
+      totalQuestions: userResults.reduce((sum, result) => sum + result.totalQuestions, 0),
+      favoriteCategory: getMostFrequentCategory(userResults),
+      recentQuizzes: userResults.slice(-5).reverse()
+    };
+    
+    res.json(stats);
+    
+  } catch (error) {
+    console.error('Error fetching user stats:', error);
+    res.status(500).json({ error: 'Failed to fetch user statistics' });
+  }
+});
+
+// Helper function for user stats
+function getMostFrequentCategory(results) {
+  const categories = results.reduce((acc, result) => {
+    acc[result.category] = (acc[result.category] || 0) + 1;
+    return acc;
+  }, {});
+  
+  return Object.keys(categories).reduce((a, b) => 
+    categories[a] > categories[b] ? a : b
+  );
+}
+
+// Serve the frontend
+app.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+// WebSocket Connection Handling
+io.on('connection', (socket) => {
+  console.log(`User connected: ${socket.id}`);
+  
+  // Store user information
+  users.set(socket.id, {
+    id: socket.id,
+    connectedAt: new Date(),
+    currentGame: null
+  });
+  
+  // Create a new game
+  socket.on('createGame', (data) => {
+    try {
+      const { playerName, avatar, settings } = data;
+      
+      const game = gameService.createGame(socket.id, playerName, avatar, settings);
+      
+      // Join the game room
+      socket.join(game.gameCode);
+      users.get(socket.id).currentGame = game.gameCode;
+      
+      socket.emit('gameCreated', game);
+      console.log(`Game created: ${game.gameCode} by ${playerName}`);
+      
+    } catch (error) {
+      socket.emit('gameError', { message: error.message });
+    }
+  });
+  
+  // Join an existing game
+  socket.on('joinGame', (data) => {
+    try {
+      const { gameCode, playerName, avatar } = data;
+      
+      const game = gameService.joinGame(gameCode, socket.id, playerName, avatar);
+      
+      // Join the game room
+      socket.join(gameCode);
+      users.get(socket.id).currentGame = gameCode;
+      
+      // Notify all players in the game
+      io.to(gameCode).emit('playerJoined', {
+        id: socket.id,
+        name: playerName,
+        avatar,
+        score: 0,
+        ready: false
+      });
+      
+      socket.emit('gameJoined', game);
+      console.log(`Player ${playerName} joined game: ${gameCode}`);
+      
+    } catch (error) {
+      socket.emit('gameError', { message: error.message });
+    }
+  });
+  
+  // Start the game
+  socket.on('startGame', (data) => {
+    try {
+      const { gameCode } = data;
+      const game = games.get(gameCode);
+      
+      if (!game || game.hostId !== socket.id) {
+        throw new Error('Only the host can start the game');
+      }
+      
+      const startedGame = gameService.startGame(gameCode);
+      
+      // Notify all players that game is starting
+      io.to(gameCode).emit('gameStarting', {
+        countdown: 5,
+        totalQuestions: startedGame.questions.length
+      });
+      
+      // Start the game after countdown
+      setTimeout(() => {
+        startedGame.status = 'in-progress';
+        io.to(gameCode).emit('gameStarted', {
+          questions: startedGame.questions,
+          totalQuestions: startedGame.questions.length
+        });
+      }, 5000);
+      
+    } catch (error) {
+      socket.emit('gameError', { message: error.message });
+    }
+  });
+  
+  // Submit answer
+  socket.on('submitAnswer', (data) => {
+    try {
+      const { gameCode, questionIndex, selectedIndex } = data;
+      
+      const result = gameService.submitAnswer(
+        gameCode, 
+        socket.id, 
+        questionIndex, 
+        selectedIndex,
+        Date.now()
+      );
+      
+      // Notify all players about the answer
+      io.to(gameCode).emit('playerAnswered', result);
+      
+      // Check if all players have answered this question
+      const game = games.get(gameCode);
+      const allAnswered = Array.from(game.players.values())
+        .every(player => player.answers.some(a => a.questionIndex === questionIndex));
+      
+      if (allAnswered) {
+        // Move to next question after a delay
+        setTimeout(() => {
+          const nextQuestionIndex = questionIndex + 1;
+          
+          if (nextQuestionIndex < game.questions.length) {
+            game.currentQuestion = nextQuestionIndex;
+            io.to(gameCode).emit('nextQuestion', {
+              index: nextQuestionIndex,
+              question: game.questions[nextQuestionIndex]
+            });
+          } else {
+            // Game finished
+            game.status = 'finished';
+            const results = gameService.getGameResults(gameCode);
+            io.to(gameCode).emit('gameFinished', results);
+            
+            // Save results to leaderboard
+            results.players.forEach(player => {
+              leaderboard.push({
+                playerName: player.name,
+                category: game.settings.category,
+                subject: game.settings.subject,
+                score: player.score,
+                correctAnswers: player.correctAnswers,
+                totalQuestions: game.questions.length,
+                accuracy: (player.correctAnswers / game.questions.length) * 100,
+                timeTaken: results.duration / 1000,
+                difficulty: game.settings.difficulty,
+                timestamp: new Date()
+              });
+            });
+          }
+        }, 3000);
+      }
+      
+    } catch (error) {
+      socket.emit('gameError', { message: error.message });
+    }
+  });
+  
+  // Player ready status
+  socket.on('playerReady', (data) => {
+    try {
+      const { gameCode, ready } = data;
+      const game = games.get(gameCode);
+      
+      if (game && game.players.has(socket.id)) {
+        game.players.get(socket.id).ready = ready;
+        
+        io.to(gameCode).emit('playerReadyChanged', {
+          playerId: socket.id,
+          ready
+        });
+      }
+    } catch (error) {
+      socket.emit('gameError', { message: error.message });
+    }
+  });
+  
+  // Handle disconnection
+  socket.on('disconnect', () => {
+    console.log(`User disconnected: ${socket.id}`);
+    
+    const user = users.get(socket.id);
+    if (user && user.currentGame) {
+      const game = games.get(user.currentGame);
+      if (game) {
+        // Notify other players
+        socket.to(user.currentGame).emit('playerLeft', socket.id);
+        
+        // If host disconnects, assign new host or end game
+        if (game.hostId === socket.id && game.status === 'waiting') {
+          const otherPlayers = Array.from(game.players.keys()).filter(id => id !== socket.id);
+          if (otherPlayers.length > 0) {
+            game.hostId = otherPlayers[0];
+            io.to(user.currentGame).emit('newHost', otherPlayers[0]);
+          } else {
+            // No players left, remove game
+            games.delete(user.currentGame);
+          }
+        }
+        
+        // Remove player from game
+        game.players.delete(socket.id);
+      }
+    }
+    
+    users.delete(socket.id);
+  });
+  
+  // Ping-pong for connection health
+  socket.on('ping', () => {
+    socket.emit('pong');
   });
 });
 
-const PORT = process.env.PORT || 3001;
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`
-🎉 QuizMaster Backend Server Started!
-📍 Port: ${PORT}
-🌍 Environment: ${process.env.NODE_ENV || 'development'}
-🚀 Frontend URL: ${FRONTEND_URL}
-📊 Ready for connections...
-  `);
+// Clean up old games periodically
+setInterval(() => {
+  gameService.cleanupOldGames();
+}, 30 * 60 * 1000); // Every 30 minutes
+
+// Error handling
+process.on('uncaughtException', (error) => {
+  console.error('Uncaught Exception:', error);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+});
+
+// Start server
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => {
+  console.log(`QuizMaster server running on port ${PORT}`);
+  console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
 });
