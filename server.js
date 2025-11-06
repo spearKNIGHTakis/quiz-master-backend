@@ -5,17 +5,31 @@ const socketIo = require('socket.io');
 const cors = require('cors');
 const path = require('path');
 
+
 const app = express();
 const server = http.createServer(app);
 const io = socketIo(server, {
   cors: {
-    origin: "*",
+    origin: [
+      "https://quiz-end-five.vercel.app",
+      "http://localhost:3000",
+      "http://127.0.0.1:3000"
+    ],
     methods: ["GET", "POST"]
   }
 });
 
+
 // Middleware
-app.use(cors());
+app.use(cors({
+  origin: [
+    "https://quiz-end-five.vercel.app",
+    "http://localhost:3000", 
+    "http://127.0.0.1:3000"
+  ],
+  methods: ["GET", "POST", "PUT", "DELETE"],
+  credentials: true
+}));
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
