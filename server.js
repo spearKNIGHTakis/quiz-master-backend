@@ -108,7 +108,16 @@ const gameService = {
     }
     
     if (game.players.size >= 8) {
-      throw new Error('Game is full');
+      throw new Error('Game is full (max 8 players)');
+    }
+    
+    // Check if player name is already taken
+    const existingPlayer = Array.from(game.players.values()).find(p => 
+      p.name.toLowerCase() === playerName.toLowerCase()
+    );
+    
+    if (existingPlayer) {
+      throw new Error('Player name already taken in this room');
     }
     
     const player = {
@@ -135,8 +144,14 @@ const gameService = {
       throw new Error('Game already started');
     }
     
-    if (game.players.size < 1) {
-      throw new Error('Not enough players');
+    if (game.players.size < 2) {
+      throw new Error('Need at least 2 players to start');
+    }
+    
+    // Check if all players are ready
+    const allReady = Array.from(game.players.values()).every(player => player.ready);
+    if (!allReady) {
+      throw new Error('All players must be ready to start');
     }
     
     // Get questions for the game
@@ -212,7 +227,8 @@ const gameService = {
       score: player.score,
       isCorrect: result.isCorrect,
       correctAnswer: result.correctAnswer,
-      explanation: result.explanation
+      explanation: result.explanation,
+      points: points
     };
   },
 
@@ -448,7 +464,13 @@ io.on('connection', (socket) => {
       socket.join(game.gameCode);
       users.get(socket.id).currentGame = game.gameCode;
       
-      socket.emit('gameCreated', game);
+      socket.emit('gameCreated', {
+        gameCode: game.gameCode,
+        hostId: game.hostId,
+        players: Array.from(game.players.values()),
+        settings: game.settings
+      });
+      
       console.log(`Game created: ${game.gameCode} by ${playerName}`);
       
     } catch (error) {
@@ -471,12 +493,20 @@ io.on('connection', (socket) => {
       io.to(gameCode).emit('playerJoined', {
         id: socket.id,
         name: playerName,
-        avatar,
+        avatar: avatar,
         score: 0,
-        ready: false
+        ready: false,
+        isHost: game.hostId === socket.id
       });
       
-      socket.emit('gameJoined', game);
+      // Send current game state to the joining player
+      socket.emit('gameJoined', {
+        gameCode: gameCode,
+        players: Array.from(game.players.values()),
+        settings: game.settings,
+        hostId: game.hostId
+      });
+      
       console.log(`Player ${playerName} joined game: ${gameCode}`);
       
     } catch (error) {
@@ -591,6 +621,32 @@ io.on('connection', (socket) => {
           playerId: socket.id,
           ready
         });
+        
+        // Notify all players about ready status
+        io.to(gameCode).emit('playerUpdated', {
+          playerId: socket.id,
+          ready: ready
+        });
+      }
+    } catch (error) {
+      socket.emit('gameError', { message: error.message });
+    }
+  });
+
+  // Chat message
+  socket.on('chatMessage', (data) => {
+    try {
+      const { gameCode, message, playerName, playerId } = data;
+      const game = games.get(gameCode);
+      
+      if (game && game.players.has(playerId)) {
+        // Broadcast message to all players in the room
+        io.to(gameCode).emit('chatMessage', {
+          playerName: playerName,
+          message: message,
+          playerId: playerId,
+          timestamp: new Date().toISOString()
+        });
       }
     } catch (error) {
       socket.emit('gameError', { message: error.message });
@@ -606,7 +662,10 @@ io.on('connection', (socket) => {
       const game = games.get(user.currentGame);
       if (game) {
         // Notify other players
-        socket.to(user.currentGame).emit('playerLeft', socket.id);
+        socket.to(user.currentGame).emit('playerLeft', {
+          playerId: socket.id,
+          playerName: game.players.get(socket.id)?.name || 'Player'
+        });
         
         // If host disconnects, assign new host or end game
         if (game.hostId === socket.id && game.status === 'waiting') {
@@ -621,7 +680,10 @@ io.on('connection', (socket) => {
         }
         
         // Remove player from game
+        const playerName = game.players.get(socket.id)?.name;
         game.players.delete(socket.id);
+        
+        console.log(`Player ${playerName} left game: ${user.currentGame}`);
       }
     }
     
