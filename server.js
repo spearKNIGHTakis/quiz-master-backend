@@ -5,7 +5,6 @@ const socketIo = require('socket.io');
 const cors = require('cors');
 const path = require('path');
 
-
 const app = express();
 const server = http.createServer(app);
 const io = socketIo(server, {
@@ -13,19 +12,22 @@ const io = socketIo(server, {
     origin: [
       "https://quiz-end-five.vercel.app",
       "http://localhost:3000",
-      "http://127.0.0.1:3000"
+      "http://127.0.0.1:3000",
+      "http://localhost:8080",
+      "http://127.0.0.1:8080"
     ],
     methods: ["GET", "POST"]
   }
 });
-
 
 // Middleware
 app.use(cors({
   origin: [
     "https://quiz-end-five.vercel.app",
     "http://localhost:3000", 
-    "http://127.0.0.1:3000"
+    "http://127.0.0.1:3000",
+    "http://localhost:8080",
+    "http://127.0.0.1:8080"
   ],
   methods: ["GET", "POST", "PUT", "DELETE"],
   credentials: true
@@ -97,7 +99,8 @@ const gameService = {
         score: 0,
         ready: true,
         answers: [],
-        connected: true
+        connected: true,
+        isHost: true
       }]]),
       settings,
       status: 'waiting', // waiting, starting, in-progress, finished
@@ -141,7 +144,8 @@ const gameService = {
       score: 0,
       ready: false,
       answers: [],
-      connected: true
+      connected: true,
+      isHost: false
     };
     
     game.players.set(playerId, player);
@@ -259,7 +263,8 @@ const gameService = {
         avatar: player.avatar,
         score: player.score,
         correctAnswers: player.answers.filter(a => a.isCorrect).length,
-        totalQuestions: game.questions.length
+        totalQuestions: game.questions.length,
+        isHost: player.isHost
       }))
       .sort((a, b) => b.score - a.score);
     
@@ -468,7 +473,7 @@ io.on('connection', (socket) => {
   });
   
   // Create a new game
-  socket.on('createGame', (data) => {
+  socket.on('createGame', (data, callback) => {
     try {
       const { playerName, avatar, settings } = data;
       
@@ -477,6 +482,15 @@ io.on('connection', (socket) => {
       // Join the game room
       socket.join(game.gameCode);
       users.get(socket.id).currentGame = game.gameCode;
+      
+      // Send success response
+      if (callback) {
+        callback({ 
+          success: true, 
+          gameCode: game.gameCode,
+          hostId: game.hostId
+        });
+      }
       
       socket.emit('gameCreated', {
         gameCode: game.gameCode,
@@ -488,12 +502,16 @@ io.on('connection', (socket) => {
       console.log(`Game created: ${game.gameCode} by ${playerName}`);
       
     } catch (error) {
+      console.error('Error creating game:', error);
+      if (callback) {
+        callback({ success: false, error: error.message });
+      }
       socket.emit('gameError', { message: error.message });
     }
   });
   
   // Join an existing game
-  socket.on('joinGame', (data) => {
+  socket.on('joinGame', (data, callback) => {
     try {
       const { gameCode, playerName, avatar } = data;
       
@@ -502,6 +520,15 @@ io.on('connection', (socket) => {
       // Join the game room
       socket.join(gameCode);
       users.get(socket.id).currentGame = gameCode;
+      
+      // Send success response
+      if (callback) {
+        callback({ 
+          success: true, 
+          gameCode: gameCode,
+          hostId: game.hostId
+        });
+      }
       
       // Notify all players in the game
       io.to(gameCode).emit('playerJoined', {
@@ -524,12 +551,16 @@ io.on('connection', (socket) => {
       console.log(`Player ${playerName} joined game: ${gameCode}`);
       
     } catch (error) {
+      console.error('Error joining game:', error);
+      if (callback) {
+        callback({ success: false, error: error.message });
+      }
       socket.emit('gameError', { message: error.message });
     }
   });
   
   // Start the game
-  socket.on('startGame', (data) => {
+  socket.on('startGame', (data, callback) => {
     try {
       const { gameCode } = data;
       const game = games.get(gameCode);
@@ -540,6 +571,11 @@ io.on('connection', (socket) => {
       
       const startedGame = gameService.startGame(gameCode);
       
+      // Send success response
+      if (callback) {
+        callback({ success: true });
+      }
+      
       // Notify all players that game is starting
       io.to(gameCode).emit('gameStarting', {
         countdown: 5,
@@ -548,20 +584,26 @@ io.on('connection', (socket) => {
       
       // Start the game after countdown
       setTimeout(() => {
-        startedGame.status = 'in-progress';
-        io.to(gameCode).emit('gameStarted', {
-          questions: startedGame.questions,
-          totalQuestions: startedGame.questions.length
-        });
+        if (startedGame.status === 'starting') {
+          startedGame.status = 'in-progress';
+          io.to(gameCode).emit('gameStarted', {
+            questions: startedGame.questions,
+            totalQuestions: startedGame.questions.length
+          });
+        }
       }, 5000);
       
     } catch (error) {
+      console.error('Error starting game:', error);
+      if (callback) {
+        callback({ success: false, error: error.message });
+      }
       socket.emit('gameError', { message: error.message });
     }
   });
   
   // Submit answer
-  socket.on('submitAnswer', (data) => {
+  socket.on('submitAnswer', (data, callback) => {
     try {
       const { gameCode, questionIndex, selectedIndex } = data;
       
@@ -573,8 +615,18 @@ io.on('connection', (socket) => {
         Date.now()
       );
       
+      // Send success response
+      if (callback) {
+        callback({ success: true });
+      }
+      
       // Notify all players about the answer
-      io.to(gameCode).emit('playerAnswered', result);
+      io.to(gameCode).emit('playerAnswered', {
+        playerId: socket.id,
+        score: result.score,
+        isCorrect: result.isCorrect,
+        points: result.points
+      });
       
       // Check if all players have answered this question
       const game = games.get(gameCode);
@@ -618,12 +670,16 @@ io.on('connection', (socket) => {
       }
       
     } catch (error) {
+      console.error('Error submitting answer:', error);
+      if (callback) {
+        callback({ success: false, error: error.message });
+      }
       socket.emit('gameError', { message: error.message });
     }
   });
   
   // Player ready status
-  socket.on('playerReady', (data) => {
+  socket.on('playerReady', (data, callback) => {
     try {
       const { gameCode, ready } = data;
       const game = games.get(gameCode);
@@ -631,29 +687,39 @@ io.on('connection', (socket) => {
       if (game && game.players.has(socket.id)) {
         game.players.get(socket.id).ready = ready;
         
+        // Send success response
+        if (callback) {
+          callback({ success: true });
+        }
+        
         io.to(gameCode).emit('playerReadyChanged', {
           playerId: socket.id,
           ready
         });
-        
-        // Notify all players about ready status
-        io.to(gameCode).emit('playerUpdated', {
-          playerId: socket.id,
-          ready: ready
-        });
+      } else {
+        throw new Error('Player not in game');
       }
     } catch (error) {
+      console.error('Error setting player ready:', error);
+      if (callback) {
+        callback({ success: false, error: error.message });
+      }
       socket.emit('gameError', { message: error.message });
     }
   });
 
   // Chat message
-  socket.on('chatMessage', (data) => {
+  socket.on('chatMessage', (data, callback) => {
     try {
       const { gameCode, message, playerName, playerId } = data;
       const game = games.get(gameCode);
       
       if (game && game.players.has(playerId)) {
+        // Send success response
+        if (callback) {
+          callback({ success: true });
+        }
+        
         // Broadcast message to all players in the room
         io.to(gameCode).emit('chatMessage', {
           playerName: playerName,
@@ -661,8 +727,14 @@ io.on('connection', (socket) => {
           playerId: playerId,
           timestamp: new Date().toISOString()
         });
+      } else {
+        throw new Error('Player not in game');
       }
     } catch (error) {
+      console.error('Error sending chat message:', error);
+      if (callback) {
+        callback({ success: false, error: error.message });
+      }
       socket.emit('gameError', { message: error.message });
     }
   });
@@ -685,8 +757,10 @@ io.on('connection', (socket) => {
         if (game.hostId === socket.id && game.status === 'waiting') {
           const otherPlayers = Array.from(game.players.keys()).filter(id => id !== socket.id);
           if (otherPlayers.length > 0) {
-            game.hostId = otherPlayers[0];
-            io.to(user.currentGame).emit('newHost', otherPlayers[0]);
+            const newHostId = otherPlayers[0];
+            game.hostId = newHostId;
+            game.players.get(newHostId).isHost = true;
+            io.to(user.currentGame).emit('newHost', newHostId);
           } else {
             // No players left, remove game
             games.delete(user.currentGame);
@@ -705,8 +779,11 @@ io.on('connection', (socket) => {
   });
   
   // Ping-pong for connection health
-  socket.on('ping', () => {
-    socket.emit('pong');
+  socket.on('ping', (callback) => {
+    if (callback) {
+      callback({ success: true, timestamp: Date.now() });
+    }
+    socket.emit('pong', { timestamp: Date.now() });
   });
 });
 
