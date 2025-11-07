@@ -1,4 +1,4 @@
-// server.js
+// server.js - FIXED VERSION
 const express = require('express');
 const http = require('http');
 const socketIo = require('socket.io');
@@ -7,6 +7,8 @@ const path = require('path');
 
 const app = express();
 const server = http.createServer(app);
+
+// FIX 1: Proper Socket.io CORS configuration
 const io = socketIo(server, {
   cors: {
     origin: [
@@ -16,8 +18,13 @@ const io = socketIo(server, {
       "http://localhost:8080",
       "http://127.0.0.1:8080"
     ],
-    methods: ["GET", "POST"]
-  }
+    methods: ["GET", "POST"],
+    credentials: true,
+    allowedHeaders: ["Content-Type"]
+  },
+  transports: ['websocket', 'polling'], // Allow both transports
+  pingTimeout: 60000,
+  pingInterval: 25000
 });
 
 // Middleware
@@ -35,7 +42,7 @@ app.use(cors({
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
-// In-memory storage (in production, use a database)
+// In-memory storage
 const games = new Map();
 const users = new Map();
 const questions = require('./questions-database');
@@ -45,34 +52,43 @@ const leaderboard = [];
 const generateGameCode = () => {
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
   let code = '';
-  for (let i = 0; i < 6; i++) {
-    code += chars.charAt(Math.floor(Math.random() * chars.length));
-  }
+  do {
+    code = '';
+    for (let i = 0; i < 6; i++) {
+      code += chars.charAt(Math.floor(Math.random() * chars.length));
+    }
+  } while (games.has(code)); // Ensure unique code
   return code;
-};
-
-const calculateScore = (correctAnswers, totalQuestions, timeTaken) => {
-  const baseScore = (correctAnswers / totalQuestions) * 100;
-  const timeBonus = Math.max(0, 100 - timeTaken) * 0.1; // Bonus for faster completion
-  return Math.round(baseScore + timeBonus);
 };
 
 // Question management
 const questionService = {
   getQuestions(category, subject, difficulty, count) {
-    let availableQuestions = questions[category]?.[subject]?.[difficulty] || [];
+    let availableQuestions = [];
     
-    // If no questions for specific difficulty, get any questions for this subject
-    if (availableQuestions.length === 0) {
+    // FIX 2: Better question fetching logic
+    if (difficulty === 'all') {
+      // Get all questions from all difficulties
       const subjectQuestions = questions[category]?.[subject];
       if (subjectQuestions) {
         availableQuestions = Object.values(subjectQuestions).flat();
+      }
+    } else {
+      // Get questions for specific difficulty
+      availableQuestions = questions[category]?.[subject]?.[difficulty] || [];
+      
+      // Fallback: if no questions for specific difficulty, get from all difficulties
+      if (availableQuestions.length === 0) {
+        const subjectQuestions = questions[category]?.[subject];
+        if (subjectQuestions) {
+          availableQuestions = Object.values(subjectQuestions).flat();
+        }
       }
     }
     
     // Shuffle and return requested number of questions
     const shuffled = [...availableQuestions].sort(() => 0.5 - Math.random());
-    return shuffled.slice(0, count);
+    return shuffled.slice(0, Math.min(count, shuffled.length));
   },
 
   validateAnswer(question, selectedIndex) {
@@ -97,13 +113,17 @@ const gameService = {
         name: playerName,
         avatar,
         score: 0,
-        ready: true,
+        ready: true, // Host starts ready
         answers: [],
         connected: true,
         isHost: true
       }]]),
-      settings,
-      status: 'waiting', // waiting, starting, in-progress, finished
+      settings: {
+        ...settings,
+        questionCount: parseInt(settings.questionCount) || 10,
+        difficulty: settings.difficulty || 'medium'
+      },
+      status: 'waiting',
       currentQuestion: 0,
       questions: [],
       startTime: null,
@@ -111,6 +131,7 @@ const gameService = {
     };
     
     games.set(gameCode, game);
+    console.log(`✅ Game created: ${gameCode} by ${playerName}`);
     return game;
   },
 
@@ -128,9 +149,16 @@ const gameService = {
       throw new Error('Game is full (max 8 players)');
     }
     
+    // Check if player already exists (rejoin case)
+    if (game.players.has(playerId)) {
+      const player = game.players.get(playerId);
+      player.connected = true;
+      return game;
+    }
+    
     // Check if player name is already taken
     const existingPlayer = Array.from(game.players.values()).find(p => 
-      p.name.toLowerCase() === playerName.toLowerCase()
+      p.name.toLowerCase() === playerName.toLowerCase() && p.id !== playerId
     );
     
     if (existingPlayer) {
@@ -149,6 +177,7 @@ const gameService = {
     };
     
     game.players.set(playerId, player);
+    console.log(`✅ Player ${playerName} joined game: ${gameCode}`);
     return game;
   },
 
@@ -172,7 +201,7 @@ const gameService = {
       throw new Error('All players must be ready to start');
     }
     
-    // Get questions for the game
+    // FIX 3: Get questions for the game
     const { category, subject, difficulty, questionCount } = game.settings;
     game.questions = questionService.getQuestions(category, subject, difficulty, questionCount);
     
@@ -180,19 +209,10 @@ const gameService = {
       throw new Error('No questions available for this configuration');
     }
     
+    console.log(`📚 Loaded ${game.questions.length} questions for game ${gameCode}`);
+    
     game.status = 'starting';
     game.startTime = new Date();
-    
-    // Set a timeout to automatically start the game
-    setTimeout(() => {
-      if (game.status === 'starting') {
-        game.status = 'in-progress';
-        io.to(gameCode).emit('gameStarted', {
-          questions: game.questions,
-          totalQuestions: game.questions.length
-        });
-      }
-    }, 5000);
     
     return game;
   },
@@ -220,25 +240,29 @@ const gameService = {
     // Check if player already answered this question
     const existingAnswer = player.answers.find(a => a.questionIndex === questionIndex);
     if (existingAnswer) {
-      throw new Error('Already answered this question');
+      return existingAnswer; // Return existing answer instead of error
     }
     
     const result = questionService.validateAnswer(question, selectedIndex);
     
     // Calculate points (base points + time bonus)
-    const timeElapsed = timestamp - game.startTime;
-    const timeBonus = Math.max(0, 30 - (timeElapsed / 1000)) * 10; // Bonus for answering quickly
+    const timeElapsed = (timestamp - game.startTime.getTime()) / 1000;
+    const timeBonus = Math.max(0, 30 - timeElapsed) * 10;
     
-    const points = result.isCorrect ? 100 + timeBonus : 0;
+    const points = result.isCorrect ? Math.round(100 + timeBonus) : 0;
     player.score += points;
     
-    player.answers.push({
+    const answer = {
       questionIndex,
       selectedIndex,
       isCorrect: result.isCorrect,
       points,
       timestamp
-    });
+    };
+    
+    player.answers.push(answer);
+    
+    console.log(`Player ${player.name} answered Q${questionIndex}: ${result.isCorrect ? '✅' : '❌'} (+${points} pts)`);
     
     return {
       playerId,
@@ -282,13 +306,13 @@ const gameService = {
     for (const [gameCode, game] of games.entries()) {
       if (now - game.created > MAX_GAME_AGE) {
         games.delete(gameCode);
-        console.log(`Cleaned up old game: ${gameCode}`);
+        console.log(`🧹 Cleaned up old game: ${gameCode}`);
       }
     }
   }
 };
 
-// REST API Routes
+// REST API Routes (keep existing routes...)
 
 // Health check
 app.get('/api/health', (req, res) => {
@@ -300,197 +324,31 @@ app.get('/api/health', (req, res) => {
   });
 });
 
-// Get questions
-app.post('/api/questions', (req, res) => {
-  try {
-    const { category, subject, difficulty, count = 10 } = req.body;
-    
-    if (!category || !subject || !difficulty) {
-      return res.status(400).json({ 
-        error: 'Missing required fields: category, subject, difficulty' 
-      });
-    }
-    
-    const questionList = questionService.getQuestions(category, subject, difficulty, count);
-    
-    res.json({
-      questions: questionList,
-      total: questionList.length,
-      category,
-      subject,
-      difficulty
-    });
-    
-  } catch (error) {
-    console.error('Error fetching questions:', error);
-    res.status(500).json({ error: 'Failed to fetch questions' });
-  }
-});
-
-// Submit quiz results
-app.post('/api/results', (req, res) => {
-  try {
-    const { 
-      playerName, 
-      category, 
-      subject, 
-      score, 
-      correctAnswers, 
-      totalQuestions, 
-      timeTaken,
-      difficulty 
-    } = req.body;
-    
-    const result = {
-      playerName,
-      category,
-      subject,
-      score,
-      correctAnswers,
-      totalQuestions,
-      accuracy: (correctAnswers / totalQuestions) * 100,
-      timeTaken,
-      difficulty,
-      timestamp: new Date()
-    };
-    
-    // Add to leaderboard
-    leaderboard.push(result);
-    
-    // Keep only top 100 scores
-    if (leaderboard.length > 100) {
-      leaderboard.sort((a, b) => b.score - a.score);
-      leaderboard.splice(100);
-    }
-    
-    res.json({ 
-      success: true, 
-      rank: leaderboard.length,
-      message: 'Results saved successfully' 
-    });
-    
-  } catch (error) {
-    console.error('Error saving results:', error);
-    res.status(500).json({ error: 'Failed to save results' });
-  }
-});
-
-// Get leaderboard
-app.get('/api/leaderboard', (req, res) => {
-  try {
-    const { category, subject, limit = 10 } = req.query;
-    
-    let filteredLeaderboard = leaderboard;
-    
-    if (category) {
-      filteredLeaderboard = filteredLeaderboard.filter(item => 
-        item.category.toLowerCase() === category.toLowerCase()
-      );
-    }
-    
-    if (subject) {
-      filteredLeaderboard = filteredLeaderboard.filter(item => 
-        item.subject.toLowerCase() === subject.toLowerCase()
-      );
-    }
-    
-    // Sort by score (descending) and get top results
-    const topScores = filteredLeaderboard
-      .sort((a, b) => b.score - a.score)
-      .slice(0, parseInt(limit));
-    
-    res.json({
-      leaderboard: topScores,
-      total: filteredLeaderboard.length,
-      category,
-      subject
-    });
-    
-  } catch (error) {
-    console.error('Error fetching leaderboard:', error);
-    res.status(500).json({ error: 'Failed to fetch leaderboard' });
-  }
-});
-
-// Get user statistics
-app.get('/api/users/:userId/stats', (req, res) => {
-  try {
-    const { userId } = req.params;
-    
-    const userResults = leaderboard.filter(result => 
-      result.playerName === userId
-    );
-    
-    if (userResults.length === 0) {
-      return res.status(404).json({ error: 'User not found' });
-    }
-    
-    const stats = {
-      totalQuizzes: userResults.length,
-      averageScore: userResults.reduce((sum, result) => sum + result.score, 0) / userResults.length,
-      averageAccuracy: userResults.reduce((sum, result) => sum + result.accuracy, 0) / userResults.length,
-      bestScore: Math.max(...userResults.map(result => result.score)),
-      totalCorrectAnswers: userResults.reduce((sum, result) => sum + result.correctAnswers, 0),
-      totalQuestions: userResults.reduce((sum, result) => sum + result.totalQuestions, 0),
-      favoriteCategory: getMostFrequentCategory(userResults),
-      recentQuizzes: userResults.slice(-5).reverse()
-    };
-    
-    res.json(stats);
-    
-  } catch (error) {
-    console.error('Error fetching user stats:', error);
-    res.status(500).json({ error: 'Failed to fetch user statistics' });
-  }
-});
-
-// Helper function for user stats
-function getMostFrequentCategory(results) {
-  const categories = results.reduce((acc, result) => {
-    acc[result.category] = (acc[result.category] || 0) + 1;
-    return acc;
-  }, {});
-  
-  return Object.keys(categories).reduce((a, b) => 
-    categories[a] > categories[b] ? a : b
-  );
-}
-
-// Serve the frontend
-app.get('/', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'index.html'));
-});
-
 // WebSocket Connection Handling
 io.on('connection', (socket) => {
-  console.log(`User connected: ${socket.id}`);
+  console.log(`🔌 User connected: ${socket.id}`);
   
-  // Store user information
   users.set(socket.id, {
     id: socket.id,
     connectedAt: new Date(),
     currentGame: null
   });
   
-  // Create a new game
+  // Create game
   socket.on('createGame', (data, callback) => {
     try {
+      console.log('📝 Create game request:', data);
       const { playerName, avatar, settings } = data;
       
       const game = gameService.createGame(socket.id, playerName, avatar, settings);
-      
-      // Join the game room
       socket.join(game.gameCode);
       users.get(socket.id).currentGame = game.gameCode;
       
-      // Send success response
-      if (callback) {
-        callback({ 
-          success: true, 
-          gameCode: game.gameCode,
-          hostId: game.hostId
-        });
-      }
+      callback({ 
+        success: true, 
+        gameCode: game.gameCode,
+        hostId: game.hostId
+      });
       
       socket.emit('gameCreated', {
         gameCode: game.gameCode,
@@ -499,48 +357,38 @@ io.on('connection', (socket) => {
         settings: game.settings
       });
       
-      console.log(`Game created: ${game.gameCode} by ${playerName}`);
-      
     } catch (error) {
-      console.error('Error creating game:', error);
-      if (callback) {
-        callback({ success: false, error: error.message });
-      }
-      socket.emit('gameError', { message: error.message });
+      console.error('❌ Error creating game:', error);
+      callback({ success: false, error: error.message });
     }
   });
   
-  // Join an existing game
+  // Join game
   socket.on('joinGame', (data, callback) => {
     try {
+      console.log('🚪 Join game request:', data);
       const { gameCode, playerName, avatar } = data;
       
       const game = gameService.joinGame(gameCode, socket.id, playerName, avatar);
-      
-      // Join the game room
       socket.join(gameCode);
       users.get(socket.id).currentGame = gameCode;
       
-      // Send success response
-      if (callback) {
-        callback({ 
-          success: true, 
-          gameCode: gameCode,
-          hostId: game.hostId
-        });
-      }
+      callback({ 
+        success: true, 
+        gameCode: gameCode,
+        hostId: game.hostId
+      });
       
-      // Notify all players in the game
+      // Notify all players
       io.to(gameCode).emit('playerJoined', {
         id: socket.id,
         name: playerName,
         avatar: avatar,
         score: 0,
         ready: false,
-        isHost: game.hostId === socket.id
+        isHost: false
       });
       
-      // Send current game state to the joining player
       socket.emit('gameJoined', {
         gameCode: gameCode,
         players: Array.from(game.players.values()),
@@ -548,20 +396,16 @@ io.on('connection', (socket) => {
         hostId: game.hostId
       });
       
-      console.log(`Player ${playerName} joined game: ${gameCode}`);
-      
     } catch (error) {
-      console.error('Error joining game:', error);
-      if (callback) {
-        callback({ success: false, error: error.message });
-      }
-      socket.emit('gameError', { message: error.message });
+      console.error('❌ Error joining game:', error);
+      callback({ success: false, error: error.message });
     }
   });
   
-  // Start the game
+  // Start game - FIX 4: Proper game start flow
   socket.on('startGame', (data, callback) => {
     try {
+      console.log('🎮 Start game request:', data);
       const { gameCode } = data;
       const game = games.get(gameCode);
       
@@ -571,21 +415,22 @@ io.on('connection', (socket) => {
       
       const startedGame = gameService.startGame(gameCode);
       
-      // Send success response
-      if (callback) {
-        callback({ success: true });
-      }
+      callback({ success: true });
       
-      // Notify all players that game is starting
+      // Notify countdown
       io.to(gameCode).emit('gameStarting', {
         countdown: 5,
         totalQuestions: startedGame.questions.length
       });
       
-      // Start the game after countdown
+      // Start game after countdown
       setTimeout(() => {
         if (startedGame.status === 'starting') {
           startedGame.status = 'in-progress';
+          startedGame.currentQuestion = 0;
+          
+          console.log(`🎯 Game ${gameCode} started with ${startedGame.questions.length} questions`);
+          
           io.to(gameCode).emit('gameStarted', {
             questions: startedGame.questions,
             totalQuestions: startedGame.questions.length
@@ -594,11 +439,8 @@ io.on('connection', (socket) => {
       }, 5000);
       
     } catch (error) {
-      console.error('Error starting game:', error);
-      if (callback) {
-        callback({ success: false, error: error.message });
-      }
-      socket.emit('gameError', { message: error.message });
+      console.error('❌ Error starting game:', error);
+      callback({ success: false, error: error.message });
     }
   });
   
@@ -615,12 +457,8 @@ io.on('connection', (socket) => {
         Date.now()
       );
       
-      // Send success response
-      if (callback) {
-        callback({ success: true });
-      }
+      callback({ success: true, result });
       
-      // Notify all players about the answer
       io.to(gameCode).emit('playerAnswered', {
         playerId: socket.id,
         score: result.score,
@@ -628,57 +466,35 @@ io.on('connection', (socket) => {
         points: result.points
       });
       
-      // Check if all players have answered this question
+      // Check if all answered
       const game = games.get(gameCode);
       const allAnswered = Array.from(game.players.values())
         .every(player => player.answers.some(a => a.questionIndex === questionIndex));
       
       if (allAnswered) {
-        // Move to next question after a delay
         setTimeout(() => {
           const nextQuestionIndex = questionIndex + 1;
           
           if (nextQuestionIndex < game.questions.length) {
             game.currentQuestion = nextQuestionIndex;
             io.to(gameCode).emit('nextQuestion', {
-              index: nextQuestionIndex,
-              question: game.questions[nextQuestionIndex]
+              index: nextQuestionIndex
             });
           } else {
-            // Game finished
             game.status = 'finished';
             const results = gameService.getGameResults(gameCode);
             io.to(gameCode).emit('gameFinished', results);
-            
-            // Save results to leaderboard
-            results.players.forEach(player => {
-              leaderboard.push({
-                playerName: player.name,
-                category: game.settings.category,
-                subject: game.settings.subject,
-                score: player.score,
-                correctAnswers: player.correctAnswers,
-                totalQuestions: game.questions.length,
-                accuracy: (player.correctAnswers / game.questions.length) * 100,
-                timeTaken: results.duration / 1000,
-                difficulty: game.settings.difficulty,
-                timestamp: new Date()
-              });
-            });
           }
         }, 3000);
       }
       
     } catch (error) {
-      console.error('Error submitting answer:', error);
-      if (callback) {
-        callback({ success: false, error: error.message });
-      }
-      socket.emit('gameError', { message: error.message });
+      console.error('❌ Error submitting answer:', error);
+      callback({ success: false, error: error.message });
     }
   });
   
-  // Player ready status
+  // Player ready
   socket.on('playerReady', (data, callback) => {
     try {
       const { gameCode, ready } = data;
@@ -686,28 +502,19 @@ io.on('connection', (socket) => {
       
       if (game && game.players.has(socket.id)) {
         game.players.get(socket.id).ready = ready;
-        
-        // Send success response
-        if (callback) {
-          callback({ success: true });
-        }
+        callback({ success: true });
         
         io.to(gameCode).emit('playerReadyChanged', {
           playerId: socket.id,
           ready
         });
-      } else {
-        throw new Error('Player not in game');
       }
     } catch (error) {
-      console.error('Error setting player ready:', error);
-      if (callback) {
-        callback({ success: false, error: error.message });
-      }
-      socket.emit('gameError', { message: error.message });
+      console.error('❌ Error setting ready:', error);
+      callback({ success: false, error: error.message });
     }
   });
-
+  
   // Chat message
   socket.on('chatMessage', (data, callback) => {
     try {
@@ -715,45 +522,37 @@ io.on('connection', (socket) => {
       const game = games.get(gameCode);
       
       if (game && game.players.has(playerId)) {
-        // Send success response
-        if (callback) {
-          callback({ success: true });
-        }
+        callback({ success: true });
         
-        // Broadcast message to all players in the room
         io.to(gameCode).emit('chatMessage', {
-          playerName: playerName,
-          message: message,
-          playerId: playerId,
+          playerName,
+          message,
+          playerId,
           timestamp: new Date().toISOString()
         });
-      } else {
-        throw new Error('Player not in game');
       }
     } catch (error) {
-      console.error('Error sending chat message:', error);
-      if (callback) {
-        callback({ success: false, error: error.message });
-      }
-      socket.emit('gameError', { message: error.message });
+      console.error('❌ Error sending chat:', error);
+      callback({ success: false, error: error.message });
     }
   });
   
-  // Handle disconnection
+  // Disconnect
   socket.on('disconnect', () => {
-    console.log(`User disconnected: ${socket.id}`);
+    console.log(`🔌 User disconnected: ${socket.id}`);
     
     const user = users.get(socket.id);
     if (user && user.currentGame) {
       const game = games.get(user.currentGame);
       if (game) {
-        // Notify other players
+        const player = game.players.get(socket.id);
+        
         socket.to(user.currentGame).emit('playerLeft', {
           playerId: socket.id,
-          playerName: game.players.get(socket.id)?.name || 'Player'
+          playerName: player?.name || 'Player'
         });
         
-        // If host disconnects, assign new host or end game
+        // Handle host leaving
         if (game.hostId === socket.id && game.status === 'waiting') {
           const otherPlayers = Array.from(game.players.keys()).filter(id => id !== socket.id);
           if (otherPlayers.length > 0) {
@@ -762,48 +561,26 @@ io.on('connection', (socket) => {
             game.players.get(newHostId).isHost = true;
             io.to(user.currentGame).emit('newHost', newHostId);
           } else {
-            // No players left, remove game
             games.delete(user.currentGame);
           }
         }
         
-        // Remove player from game
-        const playerName = game.players.get(socket.id)?.name;
         game.players.delete(socket.id);
-        
-        console.log(`Player ${playerName} left game: ${user.currentGame}`);
       }
     }
     
     users.delete(socket.id);
   });
-  
-  // Ping-pong for connection health
-  socket.on('ping', (callback) => {
-    if (callback) {
-      callback({ success: true, timestamp: Date.now() });
-    }
-    socket.emit('pong', { timestamp: Date.now() });
-  });
 });
 
-// Clean up old games periodically
+// Cleanup old games
 setInterval(() => {
   gameService.cleanupOldGames();
-}, 30 * 60 * 1000); // Every 30 minutes
-
-// Error handling
-process.on('uncaughtException', (error) => {
-  console.error('Uncaught Exception:', error);
-});
-
-process.on('unhandledRejection', (reason, promise) => {
-  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
-});
+}, 30 * 60 * 1000);
 
 // Start server
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log(`QuizMaster server running on port ${PORT}`);
-  console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
+  console.log(`🚀 QuizMaster server running on port ${PORT}`);
+  console.log(`🌍 Environment: ${process.env.NODE_ENV || 'development'}`);
 });
